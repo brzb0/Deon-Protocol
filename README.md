@@ -4,6 +4,26 @@ Repository: [https://github.com/brzb0/Deon-Protocol](https://github.com/brzb0/De
 
 Deon Protocol is a **hybrid (BLE/Wi-Fi), offline-first, ultra-secure communication protocol** designed for IoT telemetry and heavy file transfer.
 
+## Installation
+
+Available on [Crates.io](https://crates.io/crates/deon_protocol).
+
+### Binary (CLI)
+Install the command-line tool globally:
+```bash
+cargo install deon_protocol
+```
+
+### Library
+Add it to your project dependencies:
+```bash
+cargo add deon_protocol
+```
+Or add this to your `Cargo.toml`:
+```toml
+deon_protocol = "1.3.1"
+```
+
 ## Core Features
 
 - **Hybrid Transport**: Uses BLE for discovery/handshake and small commands. Automatically switches to Wi-Fi TCP for payloads > 64KB (Smart Switching).
