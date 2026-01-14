@@ -20,6 +20,10 @@ pub enum ProtocolMessage {
     HelloAck {
         public_key: Vec<u8>,
     },
+    Resume {
+        session_id: [u8; 32],
+    },
+    ResumeAck,
     SwitchToWifi {
         ssid: String,
         ip: String,

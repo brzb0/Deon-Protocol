@@ -97,6 +97,7 @@ impl TokenBucket {
 /// --- 3. Session Resumption Ticket ---
 #[derive(Debug, Clone, Zeroize, ZeroizeOnDrop)]
 pub struct ResumptionTicket {
+    pub session_id: [u8; 32],
     pub key: [u8; 32],
     pub expiry: u64, // Timestamp
 }
@@ -113,11 +114,32 @@ pub struct FileKeyStorage {
     device_id: String,
 }
 
+use std::fs::File;
+use std::io::{Read, Write};
+use std::path::Path;
+
 impl FileKeyStorage {
     pub fn new(file_path: &str, device_id: &str) -> Self {
         Self {
             _file_path: file_path.to_string(),
             device_id: device_id.to_string(),
+        }
+    }
+
+    fn get_salt(&self) -> Result<SaltString, DeonError> {
+        let salt_path = format!("{}.salt", self._file_path);
+        let path = Path::new(&salt_path);
+
+        if path.exists() {
+            let mut file = File::open(path).map_err(|_| DeonError::Io)?;
+            let mut salt_str = String::new();
+            file.read_to_string(&mut salt_str).map_err(|_| DeonError::Io)?;
+            SaltString::from_b64(&salt_str).map_err(|_| DeonError::Crypto)
+        } else {
+            let salt = SaltString::generate(&mut ArgonOsRng);
+            let mut file = File::create(path).map_err(|_| DeonError::Io)?;
+            file.write_all(salt.as_str().as_bytes()).map_err(|_| DeonError::Io)?;
+            Ok(salt)
         }
     }
 }
@@ -126,8 +148,8 @@ impl FileKeyStorage {
 impl KeyStorage for FileKeyStorage {
     async fn get_master_key(&self) -> Result<Vec<u8>, DeonError> {
         // Argon2id for Device Binding
-        // In real usage, we would read a salt from DB. Here we generate/hardcode for mock.
-        let salt = SaltString::generate(&mut ArgonOsRng);
+        // Persist salt to ensure reproducibility
+        let salt = self.get_salt()?;
         let argon2 = Argon2::default();
         
         // Use device_id as password component

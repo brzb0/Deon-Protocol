@@ -1,5 +1,7 @@
 # Deon Protocol v1.3.0
 
+Repository: [https://github.com/brzb0/Deon-Protocol](https://github.com/brzb0/Deon-Protocol)
+
 A secure, high-performance file transfer protocol implementation in Rust, featuring SPAKE2 authentication, ChaCha20-Poly1305 encryption, and intelligent Wi-Fi handover.
 
 ## Features

@@ -3,6 +3,7 @@ use crate::error::DeonError;
 use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use log::{debug};
+use std::sync::atomic::{AtomicI32, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportType {
@@ -29,11 +30,19 @@ pub async fn connect_tcp(addr: &str) -> Result<Box<dyn SecureTransport>, DeonErr
 /// TCP Implementation for Wi-Fi
 pub struct TcpTransport {
     stream: TcpStream,
+    rssi: AtomicI32,
 }
 
 impl TcpTransport {
     pub fn new(stream: TcpStream) -> Self {
-        Self { stream }
+        Self {
+            stream,
+            rssi: AtomicI32::new(-30),
+        }
+    }
+
+    pub fn set_simulated_rssi(&self, val: i32) {
+        self.rssi.store(val, Ordering::Relaxed);
     }
 }
 
@@ -72,8 +81,7 @@ impl SecureTransport for TcpTransport {
     }
 
     async fn get_rssi(&self) -> Result<i32, DeonError> {
-        // RSSI not applicable for TCP/Wi-Fi in this context, return strong signal
-        Ok(-30) 
+        Ok(self.rssi.load(Ordering::Relaxed))
     }
 }
 
