@@ -21,7 +21,7 @@ cargo add deon_protocol
 ```
 Or add this to your `Cargo.toml`:
 ```toml
-deon_protocol = "1.3.1"
+deon_protocol = "1.3.2"
 ```
 
 ## Core Features
