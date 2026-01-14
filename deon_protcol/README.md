@@ -1,4 +1,4 @@
-# Deon Protocol v1.3.0
+# Deon Protocol v1.3.1
 
 Repository: [https://github.com/brzb0/Deon-Protocol](https://github.com/brzb0/Deon-Protocol)
 
