@@ -7,9 +7,9 @@ pub const FLAG_ENCRYPTED: u8 = 0x01;
 pub const FLAG_HANDSHAKE: u8 = 0x02;
 pub const FLAG_FILE_CHUNK: u8 = 0x04;
 
-pub const NONCE_LEN: usize = 12;
+pub const NONCE_LEN: usize = 24;
 pub const TAG_LEN: usize = 16;
-pub const HEADER_LEN: usize = 2 + 1 + 1 + NONCE_LEN; // 16 bytes
+pub const HEADER_LEN: usize = 2 + 1 + 1 + NONCE_LEN; // 28 bytes
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum ProtocolMessage {
@@ -60,7 +60,7 @@ impl WireHeader {
         buf[0..2].copy_from_slice(&self.magic.to_be_bytes());
         buf[2] = self.version;
         buf[3] = self.flags;
-        buf[4..16].copy_from_slice(&self.nonce);
+        buf[4..4+NONCE_LEN].copy_from_slice(&self.nonce);
         buf
     }
 
@@ -72,7 +72,7 @@ impl WireHeader {
         let version = buf[2];
         let flags = buf[3];
         let mut nonce = [0u8; NONCE_LEN];
-        nonce.copy_from_slice(&buf[4..16]);
+        nonce.copy_from_slice(&buf[4..4+NONCE_LEN]);
 
         if magic != MAGIC_BYTES {
             return None;

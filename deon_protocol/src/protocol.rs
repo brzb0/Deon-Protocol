@@ -6,8 +6,9 @@ use crate::types::{
 };
 use log::{info, debug};
 use spake2::{Ed25519Group, Identity, Password, Spake2};
-use rand::RngCore;
 use std::time::SystemTime;
+use hkdf::Hkdf;
+use sha2::Sha256;
 
 #[derive(Debug, PartialEq)]
 pub enum ProtocolState {
@@ -131,9 +132,10 @@ impl DeonProtocol {
                  self.state = ProtocolState::Idle;
                  
                  // Issue/Store Resumption Ticket
-                 // Generate random session ID
+                 // Derive deterministic Session ID from Shared Secret
                  let mut session_id = [0u8; 32];
-                 rand::thread_rng().fill_bytes(&mut session_id);
+                 let hk = Hkdf::<Sha256>::new(None, &shared_secret);
+                 hk.expand(b"deon_session_id", &mut session_id).unwrap();
 
                  self.resumption_ticket = Some(ResumptionTicket {
                      session_id,
@@ -224,7 +226,9 @@ impl DeonProtocol {
                     // Issue Ticket for Responder too (optional, usually server issues to client, but here we keep sync)
                     // We just store the key we agreed on.
                     let mut session_id = [0u8; 32];
-                    rand::thread_rng().fill_bytes(&mut session_id);
+                    let hk = Hkdf::<Sha256>::new(None, &shared_secret);
+                    hk.expand(b"deon_session_id", &mut session_id).unwrap();
+
                     self.resumption_ticket = Some(ResumptionTicket {
                         session_id, // Note: In this simple model, Client and Server might have different session IDs if we don't exchange it.
                                     // Ideally Server sends the SessionID to client.

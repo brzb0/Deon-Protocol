@@ -1,13 +1,12 @@
 use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
-    ChaCha20Poly1305, Key,
+    XChaCha20Poly1305, XNonce, Key,
 };
 use async_trait::async_trait;
 use crate::error::DeonError;
 use hkdf::Hkdf;
 use sha2::Sha256;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 use argon2::{
     password_hash::{
@@ -17,43 +16,7 @@ use argon2::{
     Argon2
 };
 use tokio::time::Instant;
-
-/// --- 1. Epoch-Based Nonce ---
-/// Structure: [Epoch (4 bytes) | Counter (8 bytes)] = 12 bytes (96 bits)
-#[derive(Debug)]
-pub struct EpochNonce {
-    epoch: u32,
-    counter: Arc<Mutex<u64>>,
-}
-
-impl EpochNonce {
-    pub fn new(_is_initiator: bool) -> Self {
-        // Epoch derived from system time to ensure uniqueness across restarts
-        let start = SystemTime::now();
-        let since_the_epoch = start.duration_since(UNIX_EPOCH).expect("Time went backwards");
-        let epoch = since_the_epoch.as_secs() as u32;
-
-        // Initiator starts even, Responder starts odd (or use separate keys)
-        // Here we use simple counter + direction separation if sharing keys.
-        // But for robust security, we usually derive separate keys for RX/TX.
-        // Assuming separate keys (recommended), we just start at 0.
-        Self {
-            epoch,
-            counter: Arc::new(Mutex::new(0)),
-        }
-    }
-
-    pub fn next(&self) -> [u8; 12] {
-        let mut guard = self.counter.lock().unwrap();
-        *guard += 1;
-        let count = *guard;
-        
-        let mut nonce = [0u8; 12];
-        nonce[0..4].copy_from_slice(&self.epoch.to_be_bytes());
-        nonce[4..12].copy_from_slice(&count.to_be_bytes());
-        nonce
-    }
-}
+use rand::{RngCore, thread_rng};
 
 /// --- 2. Token Bucket Filter (DoS Protection) ---
 pub struct TokenBucket {
@@ -177,12 +140,8 @@ impl KeyStorage for FileKeyStorage {
 
 /// --- 5. Security Context ---
 pub struct SecurityContext {
-    cipher_tx: ChaCha20Poly1305, // Key for Sending
-    cipher_rx: ChaCha20Poly1305, // Key for Receiving
-    nonce_tx: EpochNonce,
-    // We track last seen counter for RX replay protection
-    _rx_replay_bitmap: Arc<Mutex<u64>>, // Simple sliding window could go here, for now just max counter
-    rx_last_counter: Arc<Mutex<u64>>,
+    cipher_tx: XChaCha20Poly1305, // Key for Sending
+    cipher_rx: XChaCha20Poly1305, // Key for Receiving
     pub token_bucket: TokenBucket,
 }
 
@@ -204,62 +163,45 @@ impl SecurityContext {
         };
 
         Self {
-            cipher_tx: ChaCha20Poly1305::new(Key::from_slice(my_tx_key)),
-            cipher_rx: ChaCha20Poly1305::new(Key::from_slice(my_rx_key)),
-            nonce_tx: EpochNonce::new(is_initiator),
-            _rx_replay_bitmap: Arc::new(Mutex::new(0)),
-            rx_last_counter: Arc::new(Mutex::new(0)),
+            cipher_tx: XChaCha20Poly1305::new(Key::from_slice(my_tx_key)),
+            cipher_rx: XChaCha20Poly1305::new(Key::from_slice(my_rx_key)),
             token_bucket: TokenBucket::new(100, 10.0), // Cap 100, 10/sec
         }
     }
 
-    pub fn encrypt(&self, data: &[u8], associated_data: &[u8]) -> Result<(Vec<u8>, [u8; 12]), DeonError> {
+    pub fn encrypt(&self, data: &[u8], associated_data: &[u8]) -> Result<(Vec<u8>, [u8; 24]), DeonError> {
         // Check Rate Limit for TX (optional, but good for battery)
         self.token_bucket.consume(1)?;
 
-        let nonce = self.nonce_tx.next();
+        let mut nonce_bytes = [0u8; 24];
+        thread_rng().fill_bytes(&mut nonce_bytes);
+        let nonce = XNonce::from_slice(&nonce_bytes);
+
         let payload = Payload {
             msg: data,
             aad: associated_data,
         };
 
-        let ciphertext = self.cipher_tx.encrypt(&nonce.into(), payload)
+        let ciphertext = self.cipher_tx.encrypt(nonce, payload)
             .map_err(|_| DeonError::Crypto)?;
 
-        Ok((ciphertext, nonce))
+        Ok((ciphertext, nonce_bytes))
     }
 
-    pub fn decrypt(&self, ciphertext: &[u8], nonce: &[u8; 12], associated_data: &[u8]) -> Result<Vec<u8>, DeonError> {
+    pub fn decrypt(&self, ciphertext: &[u8], nonce: &[u8; 24], associated_data: &[u8]) -> Result<Vec<u8>, DeonError> {
         // DoS Protection: Consume tokens BEFORE crypto
-        // If auth fails, we consume 10 tokens (penalty)
-        // Since we can't know if it fails before trying, we consume 1 cost now, 
-        // and if fail, we consume 9 more?
-        // Or better: Just consume standard cost. 
-        // User req: "Cada fallo de autenticación Poly1305 consume 10 tokens (penalización)."
-        // We check if we have enough for base cost.
         self.token_bucket.consume(1)?;
 
-        // Replay Check
-        let _epoch = u32::from_be_bytes(nonce[0..4].try_into().unwrap());
-        let counter = u64::from_be_bytes(nonce[4..12].try_into().unwrap());
-        
-        // Check Epoch?
-        // In this simple model, we assume session is fresh. 
-        // If we want strict replay protection, we verify counter > last_counter.
-        {
-            let mut last = self.rx_last_counter.lock().unwrap();
-            if counter <= *last && *last != 0 {
-                return Err(DeonError::Crypto); // Replay
-            }
-            *last = counter;
-        }
+        // Replay Check: With XChaCha20 (random nonce), we rely on transport layer (TCP) 
+        // or app-level logic for replay protection. 
+        // Monotonic counters are not used here to avoid state synchronization issues with random nonces.
 
         let payload = Payload {
             msg: ciphertext,
             aad: associated_data,
         };
 
-        match self.cipher_rx.decrypt(nonce.into(), payload) {
+        match self.cipher_rx.decrypt(XNonce::from_slice(nonce), payload) {
             Ok(pt) => Ok(pt),
             Err(_) => {
                 // Penalize

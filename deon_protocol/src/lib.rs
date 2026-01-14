@@ -3,6 +3,7 @@ pub mod types;
 pub mod crypto;
 pub mod transport;
 pub mod protocol;
+pub mod economy;
 
 pub use protocol::DeonProtocol;
 pub use error::DeonError;

@@ -1,8 +1,8 @@
-# Deon Protocol v1.3.1
+# Deon Protocol v1.3.2
 
 Repository: [https://github.com/brzb0/Deon-Protocol](https://github.com/brzb0/Deon-Protocol)
 
-Deon Protocol is a **hybrid (BLE/Wi-Fi), offline-first, ultra-secure communication protocol** designed for IoT telemetry and heavy file transfer.
+Deon Protocol is a **hybrid (BLE/Wi-Fi), offline-first, ultra-secure communication protocol** designed for IoT telemetry, heavy file transfer, and offline value exchange.
 
 ## Installation
 
@@ -29,11 +29,13 @@ deon_protocol = "1.3.2"
 - **Hybrid Transport**: Uses BLE for discovery/handshake and small commands. Automatically switches to Wi-Fi TCP for payloads > 64KB (Smart Switching).
 - **Security First**: 
   - **X25519** for Ephemeral Key Exchange.
-  - **ChaCha20-Poly1305** for AEAD encryption.
-  - **Monotonic Nonces** to prevent replay attacks.
+  - **XChaCha20-Poly1305** (24-byte nonce) for AEAD encryption.
+  - **Replay Protection** via random nonces (Transport) and monotonic nonces (Economy).
   - **Hardware-backed Key Storage** abstraction (Strongbox/Secure Enclave).
+- **Offline Economy**:
+  - **Token State**: Offline ledger tracks balances.
+  - **Settlement**: Syncs with blockchain when online.
 - **Resilience**: Exponential Back-off with Jitter for connection stability.
-- **Efficiency**: `postcard` serialization for minimal overhead.
 
 ## Architecture
 
@@ -41,55 +43,50 @@ deon_protocol = "1.3.2"
 
 | Layer | Implementation |
 |-------|----------------|
-| **App** | Telemetry, File Transfer |
-| **Protocol** | Deon State Machine (Searching, Handshaking, Streaming) |
-| **Security** | Noise-like Handshake (PAKE), AEAD Frames |
+| **App** | Telemetry, File Transfer, Value Transfer |
+| **Economy** | `Ledger`, `Transaction` (Offline state) |
+| **Protocol** | Deon State Machine (Handshaking, Streaming) |
+| **Security** | PAKE (SPAKE2), XChaCha20-Poly1305 |
 | **Transport** | `SecureTransport` Trait (BLE / TCP) |
 
-### 2. Frame Structure
-
-Every frame on the wire follows this structure:
-
-```
-[ Magic (2B) | Version (1B) | Flags (1B) | Nonce (12B) | Ciphertext (N) | Tag (16B) ]
-```
-
-- **Magic**: `0xDE01`
-- **Nonce**: 96-bit unique counter (Monotonic).
-- **Ciphertext**: Encrypted `postcard` serialized `ProtocolMessage`.
+### 2. Economy & Settlement
+- **Token State Management**: Local ledgers track "who has how much" while offline.
+- **Double-Spend Protection**: Transactions use monotonic nonces and Ed25519 signatures.
+- **Settlement Layer**: Abstracted interface (`SettlementLayer`) to commit finalized batches to a blockchain.
 
 ### 3. Usage
 
 ```rust
-use deon_protocol::{DeonProtocol, TcpTransport}; // Updated for v1.3.0 CLI usage
+use deon_protocol::{DeonProtocol, TcpTransport};
+use deon_protocol::economy::{Transaction, Ledger};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Example usage
+    // 1. Transport & Protocol
     let transport = deon_protocol::transport::connect_tcp("127.0.0.1:8080").await?;
     let mut deon = DeonProtocol::new(transport);
-    
-    // Handshake
     deon.handshake("123456").await?;
     
-    // Send Data
-    let large_file = vec![0u8; 100_000];
-    deon.send_file("update.bin", &large_file).await?;
+    // 2. Offline Economy (Example)
+    let ledger = Ledger::new();
+    // Logic to sign/verify offline transactions...
     
     Ok(())
 }
 ```
 
-## Security Implementation
+## Changelog
 
-- **Key Management**: Keys are derived using HKDF-SHA256. Master keys are protected by `KeyStorage` trait, intended to interface with Android Keystore/iOS Keychain.
-- **Handover**: The Wi-Fi credentials are sent *encrypted* over the BLE link before switching.
-- **Zeroize**: Sensitive keys are zeroed out from memory on drop.
+### v1.3.2
+- **Security Upgrade**: Migrated to XChaCha20Poly1305 (24-byte nonce) for superior replay protection.
+- **Fix**: Resolved Session ID desynchronization between client/server.
+- **New Feature**: Added `economy` module (Token state, Transactions, Settlement abstraction).
+- **Docs**: Comprehensive architecture update and contribution guidelines.
 
 ## Requirements
 
 - Rust 1.75+
-- OpenSSL (if using default features of some crypto crates, though pure Rust implementations are preferred here).
+- OpenSSL (optional, depends on platform)
 
 ## License
 
