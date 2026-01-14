@@ -206,6 +206,18 @@ impl DeonProtocol {
                 let mut shared_secret = [0u8; 32];
                 shared_secret.copy_from_slice(&key[0..32]);
 
+                // Issue Ticket immediately after key derivation
+                // Derive deterministic Session ID from Shared Secret
+                let mut session_id = [0u8; 32];
+                let hk = Hkdf::<Sha256>::new(None, &shared_secret);
+                hk.expand(b"deon_session_id", &mut session_id).unwrap();
+
+                self.resumption_ticket = Some(ResumptionTicket {
+                    session_id,
+                    key: shared_secret,
+                    expiry: 0,
+                });
+
                 // 4. Send Server Hello (SPAKE2 Msg2)
                 let response = ProtocolMessage::Hello {
                     public_key: msg2,
@@ -223,22 +235,6 @@ impl DeonProtocol {
                     debug!("Received Ping. Sending Pong...");
                     self.send_encrypted_message(&ProtocolMessage::Pong).await?;
                     
-                    // Issue Ticket for Responder too (optional, usually server issues to client, but here we keep sync)
-                    // We just store the key we agreed on.
-                    let mut session_id = [0u8; 32];
-                    let hk = Hkdf::<Sha256>::new(None, &shared_secret);
-                    hk.expand(b"deon_session_id", &mut session_id).unwrap();
-
-                    self.resumption_ticket = Some(ResumptionTicket {
-                        session_id, // Note: In this simple model, Client and Server might have different session IDs if we don't exchange it.
-                                    // Ideally Server sends the SessionID to client.
-                                    // But for this task, we assume Client set it? No, Client sent Resume{id}.
-                                    // Wait, if we just finished handshake, we should establish a NEW session ID.
-                                    // Let's just store the key.
-                        key: shared_secret,
-                        expiry: 0,
-                    });
-
                     self.state = ProtocolState::Idle;
                     info!("Secure Session Established (Responder).");
                     Ok(())

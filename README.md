@@ -1,4 +1,4 @@
-# Deon Protocol v1.3.2
+# Deon Protocol v1.3.3
 
 Repository: [https://github.com/brzb0/Deon-Protocol](https://github.com/brzb0/Deon-Protocol)
 
@@ -21,7 +21,7 @@ cargo add deon_protocol
 ```
 Or add this to your `Cargo.toml`:
 ```toml
-deon_protocol = "1.3.2"
+deon_protocol = "1.3.3"
 ```
 
 ## Core Features
@@ -76,6 +76,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 ## Changelog
+
+### v1.3.3
+- **Fix**: Moved Session Resumption Ticket creation to immediately after shared secret derivation (server-side) to ensure availability during handshake completion.
 
 ### v1.3.2
 - **Security Upgrade**: Migrated to XChaCha20Poly1305 (24-byte nonce) for superior replay protection.

@@ -1,4 +1,4 @@
-# Deon Protocol v1.3.2
+# Deon Protocol v1.3.3
 
 Repository: [https://github.com/brzb0/Deon-Protocol](https://github.com/brzb0/Deon-Protocol)
 
@@ -68,6 +68,9 @@ let mut ledger = Ledger::new();
 ```
 
 ## Changelog
+
+### v1.3.3
+- **Fix**: Moved Session Resumption Ticket creation to immediately after shared secret derivation (server-side).
 
 ### v1.3.2
 - **Security**: Replaced ChaCha20Poly1305 with XChaCha20Poly1305 (24-byte nonce) to eliminate nonce reuse risks.
