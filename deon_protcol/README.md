@@ -15,7 +15,7 @@ A secure, high-performance file transfer protocol implementation in Rust, featur
 Ensure you have Rust installed.
 
 ```bash
-git clone https://github.com/yourusername/deon-protocol.git
+git clone https://github.com/brzb0/Deon-Protocol
 cd deon-protocol/deon_protcol
 cargo build --release
 ```

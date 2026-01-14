@@ -2,6 +2,8 @@
 name = "deon_protocol"
 version = "1.3.0"
 edition = "2024"
+repository = "https://github.com/brzb0/Deon-Protocol"
+license = "Apache-2.0"
 
 [dependencies]
 clap = { version = "4.4", features = ["derive"] }
