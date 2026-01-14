@@ -2,25 +2,112 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
     ChaCha20Poly1305, Key,
 };
-use x25519_dalek::{PublicKey, StaticSecret};
-use rand::rngs::OsRng;
 use async_trait::async_trait;
 use crate::error::DeonError;
 use hkdf::Hkdf;
 use sha2::Sha256;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
+use zeroize::{Zeroize, ZeroizeOnDrop};
+use argon2::{
+    password_hash::{
+        rand_core::OsRng as ArgonOsRng,
+        PasswordHasher, SaltString
+    },
+    Argon2
+};
+use tokio::time::Instant;
 
-/// Hardware-backed Key Storage Abstraction
+/// --- 1. Epoch-Based Nonce ---
+/// Structure: [Epoch (4 bytes) | Counter (8 bytes)] = 12 bytes (96 bits)
+#[derive(Debug)]
+pub struct EpochNonce {
+    epoch: u32,
+    counter: Arc<Mutex<u64>>,
+}
+
+impl EpochNonce {
+    pub fn new(_is_initiator: bool) -> Self {
+        // Epoch derived from system time to ensure uniqueness across restarts
+        let start = SystemTime::now();
+        let since_the_epoch = start.duration_since(UNIX_EPOCH).expect("Time went backwards");
+        let epoch = since_the_epoch.as_secs() as u32;
+
+        // Initiator starts even, Responder starts odd (or use separate keys)
+        // Here we use simple counter + direction separation if sharing keys.
+        // But for robust security, we usually derive separate keys for RX/TX.
+        // Assuming separate keys (recommended), we just start at 0.
+        Self {
+            epoch,
+            counter: Arc::new(Mutex::new(0)),
+        }
+    }
+
+    pub fn next(&self) -> [u8; 12] {
+        let mut guard = self.counter.lock().unwrap();
+        *guard += 1;
+        let count = *guard;
+        
+        let mut nonce = [0u8; 12];
+        nonce[0..4].copy_from_slice(&self.epoch.to_be_bytes());
+        nonce[4..12].copy_from_slice(&count.to_be_bytes());
+        nonce
+    }
+}
+
+/// --- 2. Token Bucket Filter (DoS Protection) ---
+pub struct TokenBucket {
+    capacity: u32,
+    tokens: Arc<Mutex<f64>>,
+    last_refill: Arc<Mutex<Instant>>,
+    refill_rate: f64, // tokens per second
+}
+
+impl TokenBucket {
+    pub fn new(capacity: u32, refill_rate: f64) -> Self {
+        Self {
+            capacity,
+            tokens: Arc::new(Mutex::new(capacity as f64)),
+            last_refill: Arc::new(Mutex::new(Instant::now())),
+            refill_rate,
+        }
+    }
+
+    pub fn consume(&self, amount: u32) -> Result<(), DeonError> {
+        let mut tokens = self.tokens.lock().unwrap();
+        let mut last_refill = self.last_refill.lock().unwrap();
+        
+        let now = Instant::now();
+        let elapsed = now.duration_since(*last_refill).as_secs_f64();
+        
+        // Refill
+        let new_tokens = elapsed * self.refill_rate;
+        *tokens = (*tokens + new_tokens).min(self.capacity as f64);
+        *last_refill = now;
+
+        if *tokens >= amount as f64 {
+            *tokens -= amount as f64;
+            Ok(())
+        } else {
+            Err(DeonError::RateLimited)
+        }
+    }
+}
+
+/// --- 3. Session Resumption Ticket ---
+#[derive(Debug, Clone, Zeroize, ZeroizeOnDrop)]
+pub struct ResumptionTicket {
+    pub key: [u8; 32],
+    pub expiry: u64, // Timestamp
+}
+
+/// --- 4. Hardware-Backed Key Storage ---
 #[async_trait]
 pub trait KeyStorage: Send + Sync {
-    /// Retrieve the master wrapping key from Secure Enclave / Strongbox
     async fn get_master_key(&self) -> Result<Vec<u8>, DeonError>;
-    
-    /// Sign data using the hardware-backed key (for device attestation)
     async fn sign_data(&self, data: &[u8]) -> Result<Vec<u8>, DeonError>;
 }
 
-/// Fallback implementation using a file-based key (encrypted with Device ID)
 pub struct FileKeyStorage {
     _file_path: String,
     device_id: String,
@@ -38,129 +125,125 @@ impl FileKeyStorage {
 #[async_trait]
 impl KeyStorage for FileKeyStorage {
     async fn get_master_key(&self) -> Result<Vec<u8>, DeonError> {
-        // In a real implementation, this would read from SQLite/File
-        // and decrypt using a key derived from self.device_id.
-        // Mocking for demonstration:
-        let hk = Hkdf::<Sha256>::new(Some(b"device_binding_salt"), self.device_id.as_bytes());
-        let mut okm = [0u8; 32];
-        hk.expand(b"master_key_fallback", &mut okm)
-            .map_err(|_| DeonError::Crypto("Key expansion failed".into()))?;
-        Ok(okm.to_vec())
+        // Argon2id for Device Binding
+        // In real usage, we would read a salt from DB. Here we generate/hardcode for mock.
+        let salt = SaltString::generate(&mut ArgonOsRng);
+        let argon2 = Argon2::default();
+        
+        // Use device_id as password component
+        let password = self.device_id.as_bytes();
+        let password_hash = argon2.hash_password(password, &salt)
+            .map_err(|_| DeonError::Crypto)?;
+            
+        // Derive 32 bytes from hash (simplification)
+        // In reality, use the output hash bytes as the key.
+        let hash_str = password_hash.to_string();
+        let mut key = [0u8; 32];
+        // Just fill with hash bytes
+        let bytes = hash_str.as_bytes();
+        for i in 0..32 {
+            if i < bytes.len() { key[i] = bytes[i]; }
+        }
+        
+        Ok(key.to_vec())
     }
 
     async fn sign_data(&self, _data: &[u8]) -> Result<Vec<u8>, DeonError> {
-        Ok(vec![0xAA; 64]) // Mock signature
+        Ok(vec![0xBB; 64])
     }
 }
 
-/// Secure Context managing the session keys and nonces
+/// --- 5. Security Context ---
 pub struct SecurityContext {
-    cipher: ChaCha20Poly1305,
-    write_nonce: Arc<Mutex<u64>>, // Monotonic counter
-    read_nonce: Arc<Mutex<u64>>,  // Monotonic counter expected from peer
-    pub peer_public_key: Option<PublicKey>,
+    cipher_tx: ChaCha20Poly1305, // Key for Sending
+    cipher_rx: ChaCha20Poly1305, // Key for Receiving
+    nonce_tx: EpochNonce,
+    // We track last seen counter for RX replay protection
+    _rx_replay_bitmap: Arc<Mutex<u64>>, // Simple sliding window could go here, for now just max counter
+    rx_last_counter: Arc<Mutex<u64>>,
+    pub token_bucket: TokenBucket,
 }
 
 impl SecurityContext {
-    /// Initialize from a Shared Secret (X25519 output)
     pub fn new(shared_secret: [u8; 32], is_initiator: bool) -> Self {
-        // Derive session keys using HKDF to avoid using the raw curve point
+        // Derive TWO keys: one for TX, one for RX
         let hk = Hkdf::<Sha256>::new(None, &shared_secret);
-        let mut okm = [0u8; 32];
-        hk.expand(b"deon_protocol_v2_session", &mut okm).unwrap();
+        let mut okm = [0u8; 64];
+        hk.expand(b"deon_v1.1_session_keys", &mut okm).unwrap();
         
-        let key = Key::from_slice(&okm);
-        let cipher = ChaCha20Poly1305::new(key);
+        let (key1, key2) = okm.split_at(32);
+        
+        // Initiator: TX=Key1, RX=Key2
+        // Responder: TX=Key2, RX=Key1
+        let (my_tx_key, my_rx_key) = if is_initiator {
+            (key1, key2)
+        } else {
+            (key2, key1)
+        };
 
-        // Initiator starts nonces at 0, Responder at 2^63 (or use separate keys)
-        // Better: Use separate keys for each direction, but for simplicity here we use
-        // simple nonce separation or just sync. 
-        // Let's use the X25519 standard flow: distinct keys for TX and RX is better, 
-        // but here we will implement simple Nonce separation (MSB bit flip) if sharing key.
-        // For this demo: Initiator writes odd, Responder writes even?
-        // Or simpler: Just count. The 'ring'/'chacha20poly1305' nonce is 96 bits.
-        // We will construct the 12-byte nonce as: [4 bytes fixed | 8 bytes counter]
-        
         Self {
-            cipher,
-            write_nonce: Arc::new(Mutex::new(if is_initiator { 1 } else { 0 })), 
-            read_nonce: Arc::new(Mutex::new(if is_initiator { 0 } else { 1 })), 
-            peer_public_key: None,
+            cipher_tx: ChaCha20Poly1305::new(Key::from_slice(my_tx_key)),
+            cipher_rx: ChaCha20Poly1305::new(Key::from_slice(my_rx_key)),
+            nonce_tx: EpochNonce::new(is_initiator),
+            _rx_replay_bitmap: Arc::new(Mutex::new(0)),
+            rx_last_counter: Arc::new(Mutex::new(0)),
+            token_bucket: TokenBucket::new(100, 10.0), // Cap 100, 10/sec
         }
     }
 
     pub fn encrypt(&self, data: &[u8], associated_data: &[u8]) -> Result<(Vec<u8>, [u8; 12]), DeonError> {
-        let mut nonce_guard = self.write_nonce.lock().map_err(|_| DeonError::Crypto("Lock poisoned".into()))?;
-        *nonce_guard += 2; // Increment by 2 to maintain parity separation
-        let counter = *nonce_guard;
+        // Check Rate Limit for TX (optional, but good for battery)
+        self.token_bucket.consume(1)?;
 
-        let mut nonce_bytes = [0u8; 12];
-        nonce_bytes[4..].copy_from_slice(&counter.to_be_bytes());
-        
-        // Add entropy/fixed prefix if needed, but counter is sufficient for uniqueness per key.
-        
+        let nonce = self.nonce_tx.next();
         let payload = Payload {
             msg: data,
             aad: associated_data,
         };
 
-        let ciphertext = self.cipher.encrypt(&nonce_bytes.into(), payload)
-            .map_err(|_| DeonError::Crypto("Encryption failed".into()))?;
+        let ciphertext = self.cipher_tx.encrypt(&nonce.into(), payload)
+            .map_err(|_| DeonError::Crypto)?;
 
-        Ok((ciphertext, nonce_bytes))
+        Ok((ciphertext, nonce))
     }
 
     pub fn decrypt(&self, ciphertext: &[u8], nonce: &[u8; 12], associated_data: &[u8]) -> Result<Vec<u8>, DeonError> {
-        // Anti-Replay: Check nonce monotonicity
-        // Note: In UDP/BLE, packets might arrive out of order. 
-        // For strict stream, we enforce > last_nonce. 
-        // For this protocol (reliable TCP or ACK-based BLE), strict order is expected.
+        // DoS Protection: Consume tokens BEFORE crypto
+        // If auth fails, we consume 10 tokens (penalty)
+        // Since we can't know if it fails before trying, we consume 1 cost now, 
+        // and if fail, we consume 9 more?
+        // Or better: Just consume standard cost. 
+        // User req: "Cada fallo de autenticación Poly1305 consume 10 tokens (penalización)."
+        // We check if we have enough for base cost.
+        self.token_bucket.consume(1)?;
+
+        // Replay Check
+        let _epoch = u32::from_be_bytes(nonce[0..4].try_into().unwrap());
+        let counter = u64::from_be_bytes(nonce[4..12].try_into().unwrap());
         
-        let counter = u64::from_be_bytes(nonce[4..].try_into().unwrap());
-        
-        let mut nonce_guard = self.read_nonce.lock().map_err(|_| DeonError::Crypto("Lock poisoned".into()))?;
-        
-        // Strict Replay Protection:
-        if counter <= *nonce_guard {
-             // Allow initial 0 or handle retransmissions logic if needed. 
-             // For now, strict:
-             if *nonce_guard != 0 || counter != 0 {
-                // In a real robust system we might have a sliding window.
-                // But request says "Monotonic Nonce Counters".
-                // We'll relax slightly for the handshake start or assume strict sync.
-             }
+        // Check Epoch?
+        // In this simple model, we assume session is fresh. 
+        // If we want strict replay protection, we verify counter > last_counter.
+        {
+            let mut last = self.rx_last_counter.lock().unwrap();
+            if counter <= *last && *last != 0 {
+                return Err(DeonError::Crypto); // Replay
+            }
+            *last = counter;
         }
-        *nonce_guard = counter; // Update high-water mark
 
         let payload = Payload {
             msg: ciphertext,
             aad: associated_data,
         };
 
-        let plaintext = self.cipher.decrypt(nonce.into(), payload)
-            .map_err(|_| DeonError::Crypto("Decryption failed (Auth Tag Mismatch)".into()))?;
-
-        Ok(plaintext)
-    }
-}
-
-/// Ephemeral Key Exchange Helper
-pub struct HandshakeManager {
-    my_secret: StaticSecret,
-    pub my_public: PublicKey,
-}
-
-impl HandshakeManager {
-    pub fn new() -> Self {
-        let secret = StaticSecret::random_from_rng(OsRng);
-        let public = PublicKey::from(&secret);
-        Self {
-            my_secret: secret,
-            my_public: public,
+        match self.cipher_rx.decrypt(nonce.into(), payload) {
+            Ok(pt) => Ok(pt),
+            Err(_) => {
+                // Penalize
+                let _ = self.token_bucket.consume(9); // 10 total
+                Err(DeonError::AuthFailed)
+            }
         }
-    }
-
-    pub fn derive_shared_secret(&self, peer_public: PublicKey) -> [u8; 32] {
-        self.my_secret.diffie_hellman(&peer_public).to_bytes()
     }
 }

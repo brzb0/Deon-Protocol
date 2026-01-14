@@ -6,5 +6,5 @@ pub mod protocol;
 
 pub use protocol::DeonProtocol;
 pub use error::DeonError;
-pub use transport::{SecureTransport, TransportType, TcpTransport, BleTransport};
+pub use transport::{SecureTransport, TransportType, TcpTransport};
 pub use crypto::{KeyStorage, FileKeyStorage, SecurityContext};

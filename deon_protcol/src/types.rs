@@ -14,11 +14,11 @@ pub const HEADER_LEN: usize = 2 + 1 + 1 + NONCE_LEN; // 16 bytes
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum ProtocolMessage {
     Hello {
-        public_key: [u8; 32],
+        public_key: Vec<u8>,
         device_id: String,
     },
     HelloAck {
-        public_key: [u8; 32],
+        public_key: Vec<u8>,
     },
     SwitchToWifi {
         ssid: String,
