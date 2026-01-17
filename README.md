@@ -2,7 +2,8 @@
 
 Repository: [https://github.com/brzb0/Deon-Protocol](https://github.com/brzb0/Deon-Protocol)
 
-Deon Protocol is a **hybrid (BLE/Wi-Fi), offline-first, ultra-secure communication protocol** designed for IoT telemetry, heavy file transfer, and offline value exchange.
+Deon Protocol is a **hybrid (BLE/Wi-Fi), offline-first, security-focused communication protocol
+built on modern cryptographic primitives** designed for IoT telemetry, heavy file transfer, and offline value exchange.
 
 ## Installation
 
