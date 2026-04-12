@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use hkdf::Hkdf;
 use sha2::Sha256;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 #[derive(Debug, PartialEq)]
@@ -26,6 +27,14 @@ pub struct DeonProtocol {
     security_context: Option<SecurityContext>,
     resumption_ticket: Option<ResumptionTicket>,
     _buffer: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StreamReceipt {
+    pub name: String,
+    pub content_type: Option<String>,
+    pub expected_size: Option<u64>,
+    pub bytes_received: u64,
 }
 
 impl DeonProtocol {
@@ -67,8 +76,61 @@ impl DeonProtocol {
             .filter(|name| !name.is_empty())
             .ok_or(DeonError::ProtocolViolation)?;
 
-        let data = tokio::fs::read(path).await?;
-        self.send_file(filename, &data).await
+        let mut file = tokio::fs::File::open(path).await?;
+        let total_size = file.metadata().await?.len();
+        self.send_file_from_reader(filename, total_size, &mut file).await
+    }
+
+    /// Send a file payload from any AsyncRead source using file-transfer messages.
+    pub async fn send_file_from_reader<R>(&mut self, filename: &str, total_size: u64, reader: &mut R) -> Result<(), DeonError>
+    where
+        R: AsyncRead + Unpin,
+    {
+        self.state = ProtocolState::Streaming;
+
+        if total_size > 64 * 1024 && self.transport.get_type() == TransportType::Ble {
+            info!("Payload > 64KB. Initiating Wi-Fi Handover...");
+            self.perform_wifi_handover().await?;
+        }
+
+        let file_header = ProtocolMessage::FileHeader {
+            filename: filename.to_string(),
+            size: total_size,
+            checksum: 0,
+        };
+        self.send_encrypted_message(&file_header).await?;
+
+        const CHUNK_SIZE: usize = 64 * 1024;
+        let mut buffer = vec![0u8; CHUNK_SIZE];
+        let mut offset = 0u64;
+
+        loop {
+            let read = reader.read(&mut buffer).await?;
+            if read == 0 {
+                break;
+            }
+
+            let chunk_msg = ProtocolMessage::FileChunk {
+                offset,
+                data: buffer[..read].to_vec(),
+            };
+
+            self.send_encrypted_message(&chunk_msg).await?;
+            offset += read as u64;
+
+            if offset > total_size {
+                self.state = ProtocolState::Idle;
+                return Err(DeonError::ProtocolViolation);
+            }
+        }
+
+        if offset != total_size {
+            self.state = ProtocolState::Idle;
+            return Err(DeonError::ProtocolViolation);
+        }
+
+        self.state = ProtocolState::Idle;
+        Ok(())
     }
 
     /// --- 1. SPAKE2 Handshake ---
@@ -403,6 +465,180 @@ impl DeonProtocol {
 
         self.state = ProtocolState::Idle;
         Ok(())
+    }
+
+    /// Stream binary data from any AsyncRead source.
+    ///
+    /// This is intended for large payloads (e.g., videos) where loading everything
+    /// into memory is not desirable.
+    pub async fn send_stream<R>(&mut self, name: &str, total_size: u64, reader: &mut R) -> Result<(), DeonError>
+    where
+        R: AsyncRead + Unpin,
+    {
+        self.send_stream_with_metadata(name, Some(total_size), None, reader)
+            .await
+            .map(|_| ())
+    }
+
+    /// Stream data from any AsyncRead source using dedicated streaming messages.
+    pub async fn send_stream_with_metadata<R>(
+        &mut self,
+        name: &str,
+        total_size: Option<u64>,
+        content_type: Option<&str>,
+        reader: &mut R,
+    ) -> Result<u64, DeonError>
+    where
+        R: AsyncRead + Unpin,
+    {
+        self.state = ProtocolState::Streaming;
+
+        if total_size.unwrap_or(0) > 64 * 1024 && self.transport.get_type() == TransportType::Ble {
+            info!("Payload > 64KB. Initiating Wi-Fi Handover...");
+            self.perform_wifi_handover().await?;
+        }
+
+        let stream_start = ProtocolMessage::StreamStart {
+            name: name.to_string(),
+            total_size,
+            content_type: content_type.map(|value| value.to_string()),
+        };
+        self.send_encrypted_message(&stream_start).await?;
+
+        const CHUNK_SIZE: usize = 64 * 1024;
+        let mut sequence = 0u64;
+        let mut total_sent = 0u64;
+        let mut buffer = vec![0u8; CHUNK_SIZE];
+
+        loop {
+            let read = reader.read(&mut buffer).await?;
+            if read == 0 {
+                break;
+            }
+
+            let chunk = ProtocolMessage::StreamChunk {
+                sequence,
+                data: buffer[..read].to_vec(),
+            };
+            self.send_encrypted_message(&chunk).await?;
+
+            sequence += 1;
+            total_sent += read as u64;
+
+            if let Some(expected) = total_size {
+                if total_sent > expected {
+                    self.state = ProtocolState::Idle;
+                    return Err(DeonError::ProtocolViolation);
+                }
+            }
+        }
+
+        if let Some(expected) = total_size {
+            if total_sent != expected {
+                self.state = ProtocolState::Idle;
+                return Err(DeonError::ProtocolViolation);
+            }
+        }
+
+        let end = ProtocolMessage::StreamEnd {
+            total_bytes: total_sent,
+        };
+        self.send_encrypted_message(&end).await?;
+
+        self.state = ProtocolState::Idle;
+        Ok(total_sent)
+    }
+
+    /// Receive stream payload into any AsyncWrite sink.
+    pub async fn receive_stream_into_writer<W>(&mut self, writer: &mut W) -> Result<StreamReceipt, DeonError>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        self.state = ProtocolState::Streaming;
+
+        let first = self.read_and_decrypt_message().await?;
+        let (name, expected_size, content_type) = match first {
+            ProtocolMessage::StreamStart {
+                name,
+                total_size,
+                content_type,
+            } => (name, total_size, content_type),
+            _ => {
+                self.state = ProtocolState::Idle;
+                return Err(DeonError::ProtocolViolation);
+            }
+        };
+
+        let mut expected_sequence = 0u64;
+        let mut bytes_received = 0u64;
+
+        loop {
+            match self.read_and_decrypt_message().await? {
+                ProtocolMessage::StreamChunk { sequence, data } => {
+                    if sequence != expected_sequence {
+                        self.state = ProtocolState::Idle;
+                        return Err(DeonError::ProtocolViolation);
+                    }
+
+                    writer.write_all(&data).await?;
+                    bytes_received += data.len() as u64;
+                    expected_sequence += 1;
+
+                    if let Some(expected) = expected_size {
+                        if bytes_received > expected {
+                            self.state = ProtocolState::Idle;
+                            return Err(DeonError::ProtocolViolation);
+                        }
+
+                        if bytes_received % (1024 * 1024) == 0 || bytes_received == expected {
+                            info!("Stream progress: {}/{} bytes", bytes_received, expected);
+                        }
+                    } else if bytes_received % (1024 * 1024) == 0 {
+                        info!("Stream progress: {} bytes", bytes_received);
+                    }
+                }
+                ProtocolMessage::StreamEnd { total_bytes } => {
+                    if total_bytes != bytes_received {
+                        self.state = ProtocolState::Idle;
+                        return Err(DeonError::ProtocolViolation);
+                    }
+
+                    if let Some(expected) = expected_size {
+                        if expected != bytes_received {
+                            self.state = ProtocolState::Idle;
+                            return Err(DeonError::ProtocolViolation);
+                        }
+                    }
+
+                    writer.flush().await?;
+                    self.state = ProtocolState::Idle;
+
+                    return Ok(StreamReceipt {
+                        name,
+                        content_type,
+                        expected_size,
+                        bytes_received,
+                    });
+                }
+                _ => {
+                    self.state = ProtocolState::Idle;
+                    return Err(DeonError::ProtocolViolation);
+                }
+            }
+        }
+    }
+
+    /// Receive a stream and persist it into a single file path.
+    pub async fn receive_stream_to_path<P: AsRef<Path>>(&mut self, output_path: P) -> Result<StreamReceipt, DeonError> {
+        let path = output_path.as_ref();
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+        }
+
+        let mut file = tokio::fs::File::create(path).await?;
+        self.receive_stream_into_writer(&mut file).await
     }
 
     async fn perform_wifi_handover(&mut self) -> Result<(), DeonError> {

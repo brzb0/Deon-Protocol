@@ -45,6 +45,44 @@ enum Commands {
         #[arg(short, long)]
         password: Option<String>,
     },
+
+    /// Stream data from a file source using stream API (separate from file transfer API)
+    #[command(alias = "ssend")]
+    StreamSend {
+        /// Source file for stream payload
+        input: PathBuf,
+
+        /// Receiver address (ip:port)
+        #[arg(default_value = DEFAULT_ADDRESS)]
+        address: String,
+
+        /// Optional stream name seen by receiver
+        #[arg(short, long)]
+        name: Option<String>,
+
+        /// Optional stream content type (e.g. video/mp4)
+        #[arg(short = 't', long)]
+        content_type: Option<String>,
+
+        /// Shared PIN/password (or use DEON_PASSWORD env var)
+        #[arg(short, long)]
+        password: Option<String>,
+    },
+
+    /// Receive stream payload and write to a single output file
+    #[command(alias = "srecv")]
+    StreamReceive {
+        /// Port to listen on
+        #[arg(short, long, default_value_t = 8080)]
+        port: u16,
+
+        /// Output file path
+        output: PathBuf,
+
+        /// Shared PIN/password (or use DEON_PASSWORD env var)
+        #[arg(short, long)]
+        password: Option<String>,
+    },
 }
 
 fn resolve_password(password: Option<String>) -> String {
@@ -81,6 +119,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             info!("Waiting for file on port {}...", port);
             let saved_path = deon_protocol::receive_file(port, &password, &out).await?;
             info!("File saved at {}", saved_path.display());
+        }
+
+        Commands::StreamSend {
+            input,
+            address,
+            name,
+            content_type,
+            password,
+        } => {
+            let password = resolve_password(password);
+            let mut file = tokio::fs::File::open(&input).await?;
+            let total_size = file.metadata().await?.len();
+
+            let stream_name = name.or_else(|| {
+                input
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .map(|value| value.to_string())
+            }).unwrap_or_else(|| "stream.bin".to_string());
+
+            info!(
+                "Streaming '{}' ({} bytes) to {}",
+                stream_name,
+                total_size,
+                address
+            );
+
+            let sent = deon_protocol::send_stream_with_metadata(
+                &stream_name,
+                Some(total_size),
+                content_type.as_deref(),
+                &mut file,
+                &address,
+                &password,
+            ).await?;
+
+            info!("Stream sent successfully ({} bytes)", sent);
+        }
+
+        Commands::StreamReceive {
+            port,
+            output,
+            password,
+        } => {
+            let password = resolve_password(password);
+            info!("Waiting for stream on port {}...", port);
+            let receipt = deon_protocol::receive_stream_to_path(port, &password, &output).await?;
+            info!(
+                "Stream '{}' saved at {} ({} bytes)",
+                receipt.name,
+                output.display(),
+                receipt.bytes_received
+            );
         }
     }
 

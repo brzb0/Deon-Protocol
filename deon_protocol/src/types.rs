@@ -38,6 +38,18 @@ pub enum ProtocolMessage {
         offset: u64,
         data: Vec<u8>,
     },
+    StreamStart {
+        name: String,
+        total_size: Option<u64>,
+        content_type: Option<String>,
+    },
+    StreamChunk {
+        sequence: u64,
+        data: Vec<u8>,
+    },
+    StreamEnd {
+        total_bytes: u64,
+    },
     Ack {
         id: u64,
     },
