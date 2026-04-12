@@ -1,15 +1,14 @@
-use deon_protocol::{
-    DeonProtocol, transport::TcpTransport,
-};
 use clap::{Parser, Subcommand};
-use tokio::net::TcpListener;
-use tokio::io::AsyncReadExt;
 use log::info;
+use std::path::PathBuf;
+
+const DEFAULT_ADDRESS: &str = "127.0.0.1:8080";
+const DEFAULT_PASSWORD: &str = "123456";
 
 #[derive(Parser)]
-#[command(name = "deon-protocol")]
-#[command(version = "1.3.0")]
-#[command(about = "Deon Protocol Secure File Transfer CLI", long_about = None)]
+#[command(name = "deon_protocol")]
+#[command(version)]
+#[command(about = "Secure file transfer with sane defaults", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -17,108 +16,73 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Send a file to a remote peer
+    /// Send a file (default target: 127.0.0.1:8080)
     Send {
-        /// Path to the file to send
-        #[arg(short, long)]
-        file: String,
+        /// File path to send
+        file: PathBuf,
 
-        /// Address of the receiver (IP:PORT)
-        #[arg(short, long)]
+        /// Receiver address (ip:port)
+        #[arg(default_value = DEFAULT_ADDRESS)]
         address: String,
 
-        /// Shared PIN/Password for authentication
+        /// Shared PIN/password (or use DEON_PASSWORD env var)
         #[arg(short, long)]
-        password: String,
+        password: Option<String>,
     },
-    /// Receive a file from a remote peer
+
+    /// Receive one file and save it to a folder
+    #[command(alias = "recv")]
     Receive {
         /// Port to listen on
         #[arg(short, long, default_value_t = 8080)]
         port: u16,
 
-        /// Shared PIN/Password for authentication
+        /// Output folder (default: current directory)
+        #[arg(short, long, default_value = ".")]
+        out: PathBuf,
+
+        /// Shared PIN/password (or use DEON_PASSWORD env var)
         #[arg(short, long)]
-        password: String,
+        password: Option<String>,
     },
+}
+
+fn resolve_password(password: Option<String>) -> String {
+    password
+        .or_else(|| std::env::var("DEON_PASSWORD").ok())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_PASSWORD.to_string())
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Init Logging
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Send { file, address, password } => {
-            run_sender(&file, &address, &password).await?;
+        Commands::Send {
+            file,
+            address,
+            password,
+        } => {
+            let password = resolve_password(password);
+            info!("Sending '{}' to {}", file.display(), address);
+            deon_protocol::send_file(&file, &address, &password).await?;
+            info!("Transfer completed successfully");
         }
-        Commands::Receive { port, password } => {
-            run_receiver(port, &password).await?;
+
+        Commands::Receive {
+            port,
+            out,
+            password,
+        } => {
+            let password = resolve_password(password);
+            info!("Waiting for file on port {}...", port);
+            let saved_path = deon_protocol::receive_file(port, &password, &out).await?;
+            info!("File saved at {}", saved_path.display());
         }
     }
-
-    Ok(())
-}
-
-async fn run_sender(file_path: &str, address: &str, password: &str) -> Result<(), Box<dyn std::error::Error>> {
-    info!("Starting Deon Protocol Sender...");
-    
-    // 1. Read File
-    let path = std::path::Path::new(file_path);
-    let filename = path.file_name().ok_or("Invalid filename")?.to_str().ok_or("Invalid filename")?;
-    let mut file = tokio::fs::File::open(path).await?;
-    let mut data = Vec::new();
-    file.read_to_end(&mut data).await?;
-    info!("Read file '{}' ({} bytes)", filename, data.len());
-
-    // 2. Connect
-    info!("Connecting to {}...", address);
-    let transport = deon_protocol::transport::connect_tcp(address).await?;
-
-    // 3. Init Protocol
-    let mut deon = DeonProtocol::new(transport);
-
-    // 4. Handshake
-    info!("Performing Secure Handshake...");
-    deon.handshake(password).await?;
-    info!("Handshake Successful!");
-
-    // 5. Send File
-    info!("Sending File...");
-    deon.send_file(filename, &data).await?;
-    info!("File Sent Successfully!");
-
-    Ok(())
-}
-
-async fn run_receiver(port: u16, password: &str) -> Result<(), Box<dyn std::error::Error>> {
-    info!("Starting Deon Protocol Receiver on port {}...", port);
-
-    // 1. Listen
-    let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
-    info!("Listening for connections...");
-
-    // Accept one connection for this CLI tool
-    let (socket, addr) = listener.accept().await?;
-    info!("Accepted connection from: {}", addr);
-
-    // 2. Setup Transport
-    let transport = Box::new(TcpTransport::new(socket));
-
-    // 3. Init Protocol
-    let mut deon = DeonProtocol::new(transport);
-
-    // 4. Handshake
-    info!("Waiting for Secure Handshake...");
-    deon.accept_handshake(password).await?;
-    info!("Handshake Successful!");
-
-    // 5. Receive File
-    info!("Waiting for File...");
-    deon.receive_file().await?;
-    info!("File Received Successfully!");
 
     Ok(())
 }

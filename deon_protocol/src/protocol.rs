@@ -6,9 +6,11 @@ use crate::types::{
 };
 use log::{info, debug};
 use spake2::{Ed25519Group, Identity, Password, Spake2};
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use hkdf::Hkdf;
 use sha2::Sha256;
+use tokio::net::TcpListener;
 
 #[derive(Debug, PartialEq)]
 pub enum ProtocolState {
@@ -35,6 +37,38 @@ impl DeonProtocol {
             resumption_ticket: None,
             _buffer: Vec::new(),
         }
+    }
+
+    /// Connect to a TCP peer and complete handshake in one call.
+    pub async fn connect(address: &str, pin: &str) -> Result<Self, DeonError> {
+        let transport = crate::transport::connect_tcp(address).await?;
+        let mut protocol = Self::new(transport);
+        protocol.handshake(pin).await?;
+        Ok(protocol)
+    }
+
+    /// Listen on a TCP port, accept one peer and complete handshake in one call.
+    pub async fn listen(port: u16, pin: &str) -> Result<Self, DeonError> {
+        let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
+        let (socket, _) = listener.accept().await?;
+
+        let transport = Box::new(crate::transport::TcpTransport::new(socket));
+        let mut protocol = Self::new(transport);
+        protocol.accept_handshake(pin).await?;
+        Ok(protocol)
+    }
+
+    /// Read a local file path and send it as a secure transfer.
+    pub async fn send_file_path<P: AsRef<Path>>(&mut self, file_path: P) -> Result<(), DeonError> {
+        let path = file_path.as_ref();
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .ok_or(DeonError::ProtocolViolation)?;
+
+        let data = tokio::fs::read(path).await?;
+        self.send_file(filename, &data).await
     }
 
     /// --- 1. SPAKE2 Handshake ---
@@ -248,34 +282,49 @@ impl DeonProtocol {
 
     /// --- 2. Secure File Transfer (Receive) ---
     pub async fn receive_file(&mut self) -> Result<(), DeonError> {
+        self.receive_file_into(".").await.map(|_| ())
+    }
+
+    /// Receive one file and store it in the given output directory.
+    pub async fn receive_file_into<P: AsRef<Path>>(&mut self, output_dir: P) -> Result<PathBuf, DeonError> {
         self.state = ProtocolState::Streaming;
+        let output_dir = output_dir.as_ref();
+        tokio::fs::create_dir_all(output_dir).await?;
+
         let mut file: Option<tokio::fs::File> = None;
         let mut expected_size = 0u64;
         let mut received_size = 0u64;
-        let mut current_filename = String::new();
+        let mut saved_path: Option<PathBuf> = None;
 
         loop {
-            let msg = match self.read_and_decrypt_message().await {
-                Ok(m) => m,
-                Err(e) => {
-                    info!("Connection closed or error: {:?}", e);
-                    break;
-                }
-            };
+            let msg = self.read_and_decrypt_message().await?;
 
             match msg {
                 ProtocolMessage::FileHeader { filename, size, .. } => {
-                    info!("Receiving File: {} ({} bytes)", filename, size);
-                    current_filename = filename.clone();
+                    let safe_filename = Path::new(&filename)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .filter(|name| !name.is_empty())
+                        .ok_or(DeonError::ProtocolViolation)?;
+
+                    let target_path = output_dir.join(safe_filename);
+                    info!("Receiving File: {} ({} bytes)", target_path.display(), size);
+
                     expected_size = size;
                     received_size = 0;
-                    // Create file (async)
-                    file = Some(tokio::fs::File::create(&current_filename).await.map_err(|_| DeonError::Io)?);
+
+                    file = Some(tokio::fs::File::create(&target_path).await?);
+                    saved_path = Some(target_path);
+
+                    if expected_size == 0 {
+                        self.state = ProtocolState::Idle;
+                        return saved_path.ok_or(DeonError::InvalidState);
+                    }
                 }
                 ProtocolMessage::FileChunk { offset, data } => {
                     if let Some(f) = file.as_mut() {
                          use tokio::io::{AsyncSeekExt, AsyncWriteExt};
-                         // Seek to offset (handles out of order if necessary, though TCP is ordered)
+
                          f.seek(tokio::io::SeekFrom::Start(offset)).await.map_err(|_| DeonError::Io)?;
                          f.write_all(&data).await.map_err(|_| DeonError::Io)?;
                          
@@ -287,12 +336,13 @@ impl DeonProtocol {
                          }
 
                          if received_size >= expected_size {
-                             info!("File Transfer Complete: {}", current_filename);
-                             // We could break here if we only expect one file, 
-                             // but we might want to keep the session open.
-                             // For CLI "receive one file" semantics, we can break or return.
-                             return Ok(());
+                             self.state = ProtocolState::Idle;
+                             let path = saved_path.ok_or(DeonError::InvalidState)?;
+                             info!("File Transfer Complete: {}", path.display());
+                             return Ok(path);
                          }
+                    } else {
+                        return Err(DeonError::ProtocolViolation);
                     }
                 }
                 _ => {
@@ -300,7 +350,6 @@ impl DeonProtocol {
                 }
             }
         }
-        Ok(())
     }
 
     /// --- 2. Secure File Transfer with Chunking ---

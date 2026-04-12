@@ -3,7 +3,7 @@ use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use crate::error::DeonError;
-use log::{info, debug, warn};
+use log::{info, warn};
 
 /// --- 1. Transaction Structure ---
 /// Represents a value transfer or state change in the Deon Protocol.
